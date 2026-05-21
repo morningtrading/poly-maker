@@ -76,7 +76,7 @@ parameters:
     notes: 2.0 = aim to sell 2% above the avg fill. Higher = greedier; lower = faster
       but smaller gains.
   min_order_price:
-    value: 0.05
+    value: 0.15
     type: trading_global
     units: USDC (price space)
     meaning: Hard lower bound on buy-order price. Quotes below this get rejected before
@@ -84,8 +84,9 @@ parameters:
     used_in: "trading.py:66 \u2014 if order['price'] >= min_order_price and order['price']\
       \ < max_order_price"
     default: 0.05
-    notes: Lowered from 0.10 to unlock cheap-side market making. Pair with cheap_multiplier_default
-      to size up at this end of the curve.
+    notes: 'Raised from 0.05 to 0.15 to keep 10-share orders above Polymarket''s
+      $1 marketable-BUY minimum (10 sh * 0.15 = $1.50 safe margin). Cheap-side
+      markets were filling the bot''s loop with rejected orders.'
   max_order_price:
     value: 0.95
     type: trading_global
@@ -166,6 +167,25 @@ selection_filters:
     op: '>='
     column: ask_reward_per_100
     meaning: Polymarket pays the ask side - at zero, book is one-sided.
+  min_volume_24hr:
+    value: 500.0
+    op: '>='
+    column: volume_24hr
+    meaning: 24h $ volume floor. Below this the market is too thin for take-profit
+      to fire. We learned this the hard way - 13/14 initial positions were in markets
+      with <$1k/24h volume and stayed stuck.
+  max_hours_to_resolution:
+    value: 720.0
+    op: <=
+    column: hours_to_resolution
+    meaning: Skip markets resolving more than 30 days out - capital tied up too long
+      for a single small position. Derived from end_date_iso at filter time.
+  min_hours_to_resolution:
+    value: 48.0
+    op: '>='
+    column: hours_to_resolution
+    meaning: Skip markets resolving in less than 48h - step-function risk near deadline,
+      and the price already compresses to 0 or 1 with no spread to capture.
 circuit_breakers:
   enabled:
     value: true
@@ -185,7 +205,7 @@ circuit_breakers:
     meaning: Pause a single market once it has triggered this many stop-losses in
       any rolling 24h window.
   max_total_exposure_usd:
-    value: 50.0
+    value: 100.0
     meaning: Hard cap on total deployed capital across all positions (sum of size
       * avgPrice). New BUYs are blocked once this is reached.
   daily_min_realized_pnl_usd:

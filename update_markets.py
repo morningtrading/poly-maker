@@ -1,38 +1,17 @@
 import time
 import pandas as pd
 from data_updater.trading_utils import get_clob_client
-from data_updater.google_utils import get_spreadsheet
+from sqlite_wrapper import get_spreadsheet
 from data_updater.find_markets import get_sel_df, get_all_markets, get_all_results, get_markets, add_volatility_to_df
-from gspread_dataframe import set_with_dataframe
 import traceback
 
-# Initialize global variables
-spreadsheet = get_spreadsheet()
-client = get_clob_client()
-
-wk_all = spreadsheet.worksheet("All Markets")
-wk_vol = spreadsheet.worksheet("Volatility Markets")
-
-sel_df = get_sel_df(spreadsheet, "Selected Markets")
+# Global variables (lazy-loaded on first use)
+spreadsheet = None
+client = None
 
 def update_sheet(data, worksheet):
-    all_values = worksheet.get_all_values()
-    existing_num_rows = len(all_values)
-    existing_num_cols = len(all_values[0]) if all_values else 0
-
-    num_rows, num_cols = data.shape
-    max_rows = max(num_rows, existing_num_rows)
-    max_cols = max(num_cols, existing_num_cols)
-
-    # Create a DataFrame with the maximum size and fill it with empty strings
-    padded_data = pd.DataFrame('', index=range(max_rows), columns=range(max_cols))
-
-    # Update the padded DataFrame with the original data and its columns
-    padded_data.iloc[:num_rows, :num_cols] = data.values
-    padded_data.columns = list(data.columns) + [''] * (max_cols - num_cols)
-
-    # Update the sheet with the padded DataFrame, including column headers
-    set_with_dataframe(worksheet, padded_data, include_index=False, include_column_header=True, resize=True)
+    """Replace a SQLite-backed table with the given DataFrame."""
+    worksheet.update(data)
 
 def sort_df(df):
     # Calculate the mean and standard deviation for each column
@@ -75,8 +54,9 @@ def sort_df(df):
     return sorted_df
 
 def fetch_and_process_data():
-    global spreadsheet, client, wk_all, wk_vol, sel_df
+    global spreadsheet, client
     
+    # Initialize on first call
     spreadsheet = get_spreadsheet()
     client = get_clob_client()
 
@@ -101,9 +81,10 @@ def fetch_and_process_data():
     new_df = new_df.sort_values('volatility_sum', ascending=True)
     new_df['volatilty/reward'] = ((new_df['gm_reward_per_100'] / new_df['volatility_sum']).round(2)).astype(str)
 
-    new_df = new_df[['question', 'answer1', 'answer2', 'spread', 'rewards_daily_rate', 'gm_reward_per_100', 'sm_reward_per_100', 'bid_reward_per_100', 'ask_reward_per_100',  'volatility_sum', 'volatilty/reward', 'min_size', '1_hour', '3_hour', '6_hour', '12_hour', '24_hour', '7_day', '30_day',  
-                     'best_bid', 'best_ask', 'volatility_price', 'max_spread', 'tick_size',  
-                     'neg_risk',  'market_slug', 'token1', 'token2', 'condition_id']]
+    new_df = new_df[['question', 'answer1', 'answer2', 'spread', 'rewards_daily_rate', 'gm_reward_per_100', 'sm_reward_per_100', 'bid_reward_per_100', 'ask_reward_per_100',  'volatility_sum', 'volatilty/reward', 'min_size', '1_hour', '3_hour', '6_hour', '12_hour', '24_hour', '7_day', '30_day',
+                     'best_bid', 'best_ask', 'volatility_price', 'max_spread', 'tick_size',
+                     'neg_risk',  'market_slug', 'token1', 'token2', 'condition_id',
+                     'volume_24hr', 'end_date_iso']]
 
     
     volatility_df = new_df.copy()
@@ -121,7 +102,7 @@ def fetch_and_process_data():
         update_sheet(volatility_df, wk_vol)
         update_sheet(m_data, wk_full)
     else:
-        print(f'{pd.to_datetime("now")}: Not updating sheet because of length {len(new_df)}.')
+        print(f'{pd.to_datetime("now")}: Not updating tables because of length {len(new_df)}.')
 
 if __name__ == "__main__":
     while True:

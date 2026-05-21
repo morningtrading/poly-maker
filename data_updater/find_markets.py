@@ -11,13 +11,14 @@ if not os.path.exists('data'):
     os.makedirs('data')
 
 def get_sel_df(spreadsheet, sheet_name='Selected Markets'):
-    try:
-        wk2 = spreadsheet.worksheet(sheet_name)
-        sel_df = pd.DataFrame(wk2.get_all_records())
-        sel_df = sel_df[sel_df['question'] != ""].reset_index(drop=True)
+    wk2 = spreadsheet.worksheet(sheet_name)
+    sel_df = pd.DataFrame(wk2.get_all_records())
+    # Empty table → guarantee a 'question' column so downstream merges/filters work.
+    if 'question' not in sel_df.columns:
+        sel_df = pd.DataFrame(columns=['question'])
         return sel_df
-    except:
-        return pd.DataFrame()
+    sel_df = sel_df[sel_df['question'] != ""].reset_index(drop=True)
+    return sel_df
     
 def get_all_markets(client):
     cursor = ""
@@ -213,6 +214,20 @@ def process_single_row(row, client):
     ret['token2'] = token2
     ret['condition_id'] = row['condition_id']
 
+    # Tier-1 selection signal: 24h $ volume from Polymarket gamma API.
+    # WHY: CLOB sampling-markets does not include volume. Without this,
+    # the bot was selecting dead pools (we saw 13/14 positions in markets
+    # with <$1k/24h volume — no chance of TP fills).
+    # If the call fails we record 0 so the filter excludes the market by default.
+    try:
+        g = requests.get(
+            f"https://gamma-api.polymarket.com/markets?condition_ids={row['condition_id']}",
+            timeout=10,
+        ).json()
+        ret['volume_24hr'] = float((g[0] or {}).get('volume24hr') or 0) if g else 0.0
+    except Exception:
+        ret['volume_24hr'] = 0.0
+
     return ret
 
 
@@ -324,7 +339,7 @@ def get_markets(all_results, sel_df, maker_reward=1):
     new_df = new_df.sort_values('rewards_daily_rate', ascending=False)
     new_df[' '] = ''
 
-    new_df = new_df[['question', 'answer1', 'answer2', 'neg_risk', 'spread', 'best_bid', 'best_ask', 'rewards_daily_rate', 'bid_reward_per_100', 'ask_reward_per_100', 'gm_reward_per_100', 'sm_reward_per_100', 'min_size', 'max_spread', 'tick_size', 'market_slug', 'token1', 'token2', 'condition_id']]
+    new_df = new_df[['question', 'answer1', 'answer2', 'neg_risk', 'spread', 'best_bid', 'best_ask', 'rewards_daily_rate', 'bid_reward_per_100', 'ask_reward_per_100', 'gm_reward_per_100', 'sm_reward_per_100', 'min_size', 'max_spread', 'tick_size', 'market_slug', 'token1', 'token2', 'condition_id', 'volume_24hr', 'end_date_iso']]
     new_df = new_df.replace([np.inf, -np.inf], 0)
     all_data = new_df.copy()
     s_df = new_df.copy()

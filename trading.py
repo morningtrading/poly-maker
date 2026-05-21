@@ -13,6 +13,13 @@ import poly_data.CONSTANTS as CONSTANTS
 from poly_data.trading_utils import get_best_bid_ask_deets, get_order_prices, get_buy_sell_amount, round_down, round_up
 from poly_data.data_utils import get_position, get_order, set_position
 
+# Module-level constants sourced from config/standard_config.yaml at import time.
+# Read once for hot-path speed; restart the bot to pick up YAML changes.
+from PM_config_loader import global_params as _global_params
+_GP = _global_params()
+MIN_ORDER_PRICE = float(_GP.get("min_order_price", 0.05))
+MAX_ORDER_PRICE = float(_GP.get("max_order_price", 0.95))
+
 # Create directory for storing position risk information
 if not os.path.exists('positions/'):
     os.makedirs('positions/')
@@ -62,19 +69,38 @@ def send_buy_order(order):
         trade = False
 
     if trade:
-        # Only place orders with prices between 0.1 and 0.9 to avoid extreme positions
-        if order['price'] >= 0.1 and order['price'] < 0.9:
+        # Only place orders within the configured price band (YAML: min_order_price / max_order_price).
+        if order['price'] >= MIN_ORDER_PRICE and order['price'] < MAX_ORDER_PRICE:
+            # Per-market circuit-breaker: skip this market if it has tripped its
+            # 24h stop-loss count cap. Daily caps are checked at the API boundary
+            # in polymarket_client.create_order; this is the per-market layer.
+            try:
+                import PM_circuit_breakers as _cb
+                question = order.get('row', {}).get('question') if hasattr(order.get('row', {}), 'get') else None
+                if question is None:
+                    try:
+                        question = order['row']['question']
+                    except Exception:
+                        question = None
+                if question:
+                    blocked, reason = _cb.should_block_buy(question)
+                    if blocked:
+                        print(f"[CIRCUIT] skipping BUY on '{question[:50]}...': {reason}")
+                        return
+            except Exception as _cb_err:
+                print(f"[circuit] per-market check failed (continuing): {_cb_err}")
+
             print(f'Creating new order for {order["size"]} at {order["price"]}')
             print(order['token'], 'BUY', order['price'], order['size'])
             client.create_order(
-                order['token'], 
-                'BUY', 
-                order['price'], 
-                order['size'], 
+                order['token'],
+                'BUY',
+                order['price'],
+                order['size'],
                 True if order['neg_risk'] == 'TRUE' else False
             )
         else:
-            print("Not creating buy order because its outside acceptable price range (0.1-0.9)")
+            print(f"Not creating buy order because its outside acceptable price range ({MIN_ORDER_PRICE}-{MAX_ORDER_PRICE})")
     else:
         print(f'Not creating new order because order price of {order["price"]} is less than incentive start price of {incentive_start}. Mid price is {order["mid_price"]}')
 
@@ -199,7 +225,14 @@ async def perform_trade(market):
                 #if deet has None for one these values below, call it with min size of 20
                 if deets['best_bid'] is None or deets['best_ask'] is None or deets['best_bid_size'] is None or deets['best_ask_size'] is None:
                     deets = get_best_bid_ask_deets(market, detail['name'], 20, 0.1)
-                
+
+                # If the book is still one-sided after the re-fetch, skip this side.
+                # Prevents `round(None, ...)` from raising TypeError on illiquid markets.
+                if deets['best_bid'] is None or deets['best_ask'] is None:
+                    print(f"Skipping {detail['name']} side of {row.get('question', market)[:60]}: "
+                          f"book still has None bid/ask after re-fetch")
+                    continue
+
                 # Extract all order book details
                 best_bid = deets['best_bid']
                 best_bid_size = deets['best_bid_size']
@@ -215,6 +248,18 @@ async def perform_trade(market):
                 # Round prices to appropriate precision
                 best_bid = round(best_bid, round_length)
                 best_ask = round(best_ask, round_length)
+
+                # Paper-fill simulator: if DRY_RUN, check whether any orders
+                # we "would have posted" last cycle have been crossed by the
+                # real book. Detected fills are recorded against paper positions
+                # for the Paper tab.
+                try:
+                    import os as _os
+                    if str(_os.getenv("DRY_RUN", "false")).lower() in ("1", "true", "yes", "on"):
+                        import PM_paper_fills as _pf
+                        _pf.check_fills(token, best_bid, best_ask, row.get("question", ""))
+                except Exception as _pf_err:
+                    print(f"[paper] check_fills failed: {_pf_err}")
 
                 # Calculate ratio of buy vs sell liquidity in the market
                 try:
@@ -259,11 +304,12 @@ async def perform_trade(market):
                 other_token = global_state.REVERSE_TOKENS[str(token)]
                 other_position = get_position(other_token)['size']
                 
-                # Calculate how much to buy or sell based on our position
-                buy_amount, sell_amount = get_buy_sell_amount(position, bid_price, row, other_position)
-                
-                # Get max_size for logging (same logic as in get_buy_sell_amount)
-                max_size = row.get('max_size', row['trade_size'])
+                # Calculate how much to buy or sell based on our position.
+                # effective_trade_size / effective_max_size reflect the cheap-asset
+                # multiplier (if applied) so the log below matches what's used.
+                buy_amount, sell_amount, effective_trade_size, max_size = get_buy_sell_amount(
+                    position, bid_price, row, other_position
+                )
 
                 # Prepare order object with all necessary information
                 order = {
@@ -275,9 +321,9 @@ async def perform_trade(market):
                     'token_name': detail['name'],
                     'row': row
                 }
-            
+
                 print(f"Position: {position}, Other Position: {other_position}, "
-                      f"Trade Size: {row['trade_size']}, Max Size: {max_size}, "
+                      f"Trade Size: {effective_trade_size}, Max Size: {max_size}, "
                       f"buy_amount: {buy_amount}, sell_amount: {sell_amount}")
 
                 # File to store risk management information for this market
@@ -295,63 +341,92 @@ async def perform_trade(market):
 
                     # Get fresh market data for risk assessment
                     n_deets = get_best_bid_ask_deets(market, detail['name'], 100, 0.1)
-                    
-                    # Calculate current market price and spread
-                    mid_price = round_up((n_deets['best_bid'] + n_deets['best_ask']) / 2, round_length)
-                    spread = round(n_deets['best_ask'] - n_deets['best_bid'], 2)
 
-                    # Calculate current profit/loss on position
-                    pnl = (mid_price - avgPrice) / avgPrice * 100
+                    # Skip stop-loss evaluation when the size-filtered book is
+                    # one-sided. mid_price/spread/pnl/ratio are undefined under
+                    # those conditions, and exiting at an unknown bid is worse
+                    # than waiting for the book to re-form. Falls through to
+                    # the regular take-profit / buy logic below.
+                    if n_deets['best_bid'] is not None and n_deets['best_ask'] is not None:
+                        # Calculate current market price and spread
+                        mid_price = round_up((n_deets['best_bid'] + n_deets['best_ask']) / 2, round_length)
+                        spread = round(n_deets['best_ask'] - n_deets['best_bid'], 2)
 
-                    print(f"Mid Price: {mid_price}, Spread: {spread}, PnL: {pnl}")
-                    
-                    # Prepare risk details for tracking
-                    risk_details = {
-                        'time': str(pd.Timestamp.utcnow().tz_localize(None)),
-                        'question': row['question']
-                    }
+                        # Calculate current profit/loss on position
+                        pnl = (mid_price - avgPrice) / avgPrice * 100
 
-                    try:
-                        ratio = (n_deets['bid_sum_within_n_percent']) / (n_deets['ask_sum_within_n_percent'])
-                    except:
-                        ratio = 0
+                        print(f"Mid Price: {mid_price}, Spread: {spread}, PnL: {pnl}")
 
-                    pos_to_sell = sell_amount  # Amount to sell in risk-off scenario
+                        # Prepare risk details for tracking
+                        risk_details = {
+                            'time': str(pd.Timestamp.utcnow().tz_localize(None)),
+                            'question': row['question']
+                        }
 
-                    # ------- STOP-LOSS LOGIC -------
-                    # Trigger stop-loss if either:
-                    # 1. PnL is below threshold and spread is tight enough to exit
-                    # 2. Volatility is too high
-                    if (pnl < params['stop_loss_threshold'] and spread <= params['spread_threshold']) or row['3_hour'] > params['volatility_threshold']:
-                        risk_details['msg'] = (f"Selling {pos_to_sell} because spread is {spread} and pnl is {pnl} "
-                                              f"and ratio is {ratio} and 3 hour volatility is {row['3_hour']}")
-                        print("Stop loss Triggered: ", risk_details['msg'])
+                        try:
+                            ratio = (n_deets['bid_sum_within_n_percent']) / (n_deets['ask_sum_within_n_percent'])
+                        except:
+                            ratio = 0
 
-                        # Sell at market best bid to ensure execution
-                        order['size'] = pos_to_sell
-                        order['price'] = n_deets['best_bid']
+                        # Stop-loss is an exit, not a maker quote — dump the whole position
+                        # in one ticket so we don't bleed slippage across N trade_size chunks.
+                        pos_to_sell = position
 
-                        # Set period to avoid trading after stop-loss
-                        risk_details['sleep_till'] = str(pd.Timestamp.utcnow().tz_localize(None) + 
-                                                        pd.Timedelta(hours=params['sleep_period']))
+                        # ------- STOP-LOSS LOGIC -------
+                        # Trigger stop-loss if either:
+                        # 1. PnL is below threshold and spread is tight enough to exit
+                        # 2. Volatility is too high
+                        if (pnl < params['stop_loss_threshold'] and spread <= params['spread_threshold']) or row['3_hour'] > params['volatility_threshold']:
+                            risk_details['msg'] = (f"Selling {pos_to_sell} because spread is {spread} and pnl is {pnl} "
+                                                  f"and ratio is {ratio} and 3 hour volatility is {row['3_hour']}")
+                            print("Stop loss Triggered: ", risk_details['msg'])
 
-                        print("Risking off")
-                        send_sell_order(order)
-                        client.cancel_all_market(market)
+                            # Sell at market best bid to ensure execution
+                            order['size'] = pos_to_sell
+                            order['price'] = n_deets['best_bid']
 
-                        # Save risk details to file
-                        open(fname, 'w').write(json.dumps(risk_details))
-                        continue
+                            # Set period to avoid trading after stop-loss
+                            risk_details['sleep_till'] = str(pd.Timestamp.utcnow().tz_localize(None) +
+                                                            pd.Timedelta(hours=params['sleep_period']))
+
+                            print("Risking off")
+                            send_sell_order(order)
+                            client.cancel_all_market(market)
+
+                            # Save risk details to file
+                            open(fname, 'w').write(json.dumps(risk_details))
+
+                            # Tell the circuit-breaker module that a stop-loss just fired
+                            # so the daily caps can refuse further BUYs if we keep losing.
+                            try:
+                                import PM_circuit_breakers as _cb
+                                est_loss = abs(pnl) / 100.0 * avgPrice * pos_to_sell
+                                _cb.record_stop_loss(
+                                    market=row['question'],
+                                    size=pos_to_sell,
+                                    loss_usd=est_loss,
+                                    dry_run=getattr(client, 'dry_run', False),
+                                )
+                            except Exception as _cb_err:
+                                print(f"[circuit] record_stop_loss failed: {_cb_err}")
+                            continue
+                    else:
+                        print(f"Skipping stop-loss check for {market}: one-sided book "
+                              f"(best_bid={n_deets['best_bid']}, best_ask={n_deets['best_ask']})")
 
                 # ------- BUY ORDER LOGIC -------
                 # Get max_size, defaulting to trade_size if not specified
                 max_size = row.get('max_size', row['trade_size'])
                 
                 # Only buy if:
-                # 1. Position is less than max_size (new logic)
+                # 1. Position is less than max_size
                 # 2. Position is less than absolute cap (250)
-                # 3. Buy amount is above minimum size
-                if position < max_size and position < 250 and buy_amount > 0 and buy_amount >= row['min_size']:
+                # 3. Buy amount is positive
+                # NOTE: previously also gated on `buy_amount >= row['min_size']`,
+                # but `min_size` here maps to rewards.min_size (often $500–$1000),
+                # not Polymarket's actual order minimum. Gate dropped because the
+                # user trades without targeting maker rewards.
+                if position < max_size and position < 250 and buy_amount > 0:
                     # Get reference price from market data
                     sheet_value = row['best_bid']
 
