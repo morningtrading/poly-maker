@@ -1,0 +1,194 @@
+parameters:
+  trade_size:
+    value: 10.0
+    type: trading_default
+    units: USDC
+    meaning: Order size in USDC per quote on each side of the book (bid and ask).
+    used_in: "poly_data/trading_utils.py:158 \u2014 buy_amount = min(trade_size, remaining_to_max)"
+    default: 50.0
+    notes: Must be >= the market's `min_size`. For markets with min_size > 10 (e.g.
+      KBO at 500), the bot will either bump the order up or skip it entirely.
+  max_size:
+    value: 10.0
+    type: trading_default
+    units: USDC
+    meaning: Total per-market position cap in USDC. The bot stacks trade_size quotes
+      until total exposure reaches this value, then switches to exit-only quoting.
+    used_in: "poly_data/trading_utils.py:164,180 \u2014 if position < max_size \u2026\
+      \ allow some flexibility for market making"
+    default: 50.0
+    notes: "Defaults to trade_size if NULL in selected_markets. 3\xD7trade_size is\
+      \ a common starting ratio (3-leg accumulation) but pick based on your bankroll."
+  stop_loss_threshold:
+    value: -0.1
+    type: bucket_param
+    bucket: default
+    units: ratio
+    meaning: PnL ratio (negative) that forces an exit of a losing position.
+    used_in: "trading.py:325 \u2014 if (pnl < params['stop_loss_threshold'] and spread\
+      \ <= params['spread_threshold']) or row['3_hour'] > params['volatility_threshold']"
+    default: -0.1
+    notes: 'Example: -0.10 means close the position once it''s down 10% of cost. More
+      negative = more tolerant of drawdown.'
+  spread_threshold:
+    value: 0.05
+    type: bucket_param
+    bucket: default
+    units: USDC (price space)
+    meaning: "Maximum bid/ask spread at which the stop-loss is still allowed to execute.\
+      \ Wider spreads suggest illiquid book \u2014 exiting then would lock in a worse\
+      \ fill."
+    used_in: "trading.py:325 \u2014 and spread <= params['spread_threshold']"
+    default: 0.05
+    notes: "Polymarket prices are 0\u20131. 0.05 = 5 cents wide. Tighten this if you\
+      \ want fewer panic exits in thin books."
+  volatility_threshold:
+    value: 0.2
+    type: bucket_param
+    bucket: default
+    units: ratio
+    meaning: Cap on the market's 3-hour realised volatility. Above this, the bot exits
+      and stops re-entering.
+    used_in: "trading.py:325,387 \u2014 row['3_hour'] > params['volatility_threshold']"
+    default: 0.2
+    notes: 0.20 = 20% 3-hour move. Lower this for more conservative behaviour around
+      news events.
+  sleep_period:
+    value: 24
+    type: bucket_param
+    bucket: default
+    units: hours
+    meaning: How long to stay out of a market after being stopped out, before considering
+      re-entry.
+    used_in: "trading.py:336 \u2014 pd.Timedelta(hours=params['sleep_period'])"
+    default: 24
+    notes: "Prevents loss-chasing. Raise to 48\u201372 for slower markets, lower for\
+      \ fast-moving event books."
+  take_profit_threshold:
+    value: 2.0
+    type: bucket_param
+    bucket: default
+    units: percent
+    meaning: Profit threshold (as a percentage of average entry price) at which to
+      set the sell quote.
+    used_in: "trading.py:436 \u2014 tp_price = avgPrice + avgPrice * params['take_profit_threshold']/100"
+    default: 2.0
+    notes: 2.0 = aim to sell 2% above the avg fill. Higher = greedier; lower = faster
+      but smaller gains.
+  min_order_price:
+    value: 0.05
+    type: trading_global
+    units: USDC (price space)
+    meaning: Hard lower bound on buy-order price. Quotes below this get rejected before
+      submission.
+    used_in: "trading.py:66 \u2014 if order['price'] >= min_order_price and order['price']\
+      \ < max_order_price"
+    default: 0.05
+    notes: Lowered from 0.10 to unlock cheap-side market making. Pair with cheap_multiplier_default
+      to size up at this end of the curve.
+  max_order_price:
+    value: 0.95
+    type: trading_global
+    units: USDC (price space)
+    meaning: Hard upper bound on buy-order price. Quotes at/above this get rejected.
+    used_in: "trading.py:66 \u2014 if order['price'] >= min_order_price and order['price']\
+      \ < max_order_price"
+    default: 0.95
+    notes: Widened from 0.90 symmetrically with the new 0.05 lower bound. Bot quotes
+      both sides, so a 0.05 YES is a 0.95 NO.
+  cheap_price_threshold:
+    value: 0.1
+    type: trading_global
+    units: USDC (price space)
+    meaning: Bid-price below which the cheap-asset multiplier applies.
+    used_in: "poly_data/trading_utils.py:190 \u2014 if bid_price < cheap_price_threshold"
+    default: 0.1
+    notes: Defines the 'cheap regime'. Anything in [min_order_price, cheap_price_threshold)
+      gets the multiplier; above that the buy_amount is unchanged.
+  cheap_multiplier_default:
+    value: 1
+    type: trading_global
+    units: count
+    meaning: Default size multiplier applied to buy_amount when bid_price < cheap_price_threshold,
+      used when selected_markets.multiplier is blank.
+    used_in: "poly_data/trading_utils.py:191-194 \u2014 buy_amount = buy_amount *\
+      \ multiplier"
+    default: 4
+    notes: Per-market column selected_markets.multiplier overrides this default. 4x
+      is conservative on dollar risk vs a 0.50 quote; equal-$-risk at 0.05 would be
+      ~10x. Tune with PM_set_multiplier.py.
+selection_filters:
+  min_gm_reward_per_100:
+    value: 1.0
+    op: '>='
+    column: gm_reward_per_100
+    meaning: Reward density floor. Below this, daily maker rewards don't justify the
+      gas / risk.
+  max_volatility_sum:
+    value: 85.0
+    op: <=
+    column: volatility_sum
+    meaning: Calm-market cap (sum of 24h+7d+14d realized vol). Below median means
+      fewer stop-outs.
+  max_3_hour:
+    value: 0.23999999999999996
+    op: <=
+    column: 3_hour
+    meaning: Recent 3-hour realized vol cap. Skip markets currently spiking.
+  max_spread:
+    value: 0.05
+    op: <=
+    column: spread
+    meaning: Max bid/ask spread (price space). Wider books are illiquid and dangerous.
+  min_best_bid:
+    value: 0.05
+    op: '>='
+    column: best_bid
+    meaning: Avoid converged markets pricing near zero (one outcome already settled).
+  max_best_ask:
+    value: 0.9
+    op: <=
+    column: best_ask
+    meaning: Same on the other side.
+  max_min_size:
+    value: 1000000.0
+    op: <=
+    column: min_size
+    meaning: 'DISABLED (set to 1e6): this column maps to rewards.min_size, not the
+      trade minimum. We trade non-reward markets at our $10 cap.'
+  min_bid_reward_per_100:
+    value: 0.01
+    op: '>='
+    column: bid_reward_per_100
+    meaning: Polymarket pays the bid side - at zero, book is one-sided.
+  min_ask_reward_per_100:
+    value: 0.05
+    op: '>='
+    column: ask_reward_per_100
+    meaning: Polymarket pays the ask side - at zero, book is one-sided.
+circuit_breakers:
+  enabled:
+    value: true
+    meaning: Master switch. Set false to disable all breakers.
+  count_dry_run:
+    value: false
+    meaning: Whether DRY_RUN stop-losses count toward daily caps (recommended during
+      paper testing).
+  daily_max_stop_loss_count:
+    value: 10
+    meaning: Abort all new BUYs once today's stop-loss event count reaches this.
+  daily_max_stop_loss_loss_usd:
+    value: 5.0
+    meaning: Abort all new BUYs once today's total stop-loss losses (USDC) reach this.
+  per_market_max_stop_loss_24h:
+    value: 3
+    meaning: Pause a single market once it has triggered this many stop-losses in
+      any rolling 24h window.
+  max_total_exposure_usd:
+    value: 50.0
+    meaning: Hard cap on total deployed capital across all positions (sum of size
+      * avgPrice). New BUYs are blocked once this is reached.
+  daily_min_realized_pnl_usd:
+    value: -30.0
+    meaning: Floor on today's cumulative realised PnL (USDC). New BUYs are blocked
+      once this is breached (i.e. PnL <= floor).

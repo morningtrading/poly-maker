@@ -1,10 +1,19 @@
 from dotenv import load_dotenv          # Environment variable management
 import os                           # Operating system interface
 
-# Polymarket API client libraries
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs, BalanceAllowanceParams, AssetType, PartialCreateOrderOptions
-from py_clob_client.constants import POLYGON
+# Polymarket API client libraries (CLOB V2)
+from py_clob_client_v2 import (
+    ClobClient,
+    OrderArgs,
+    OrderType,
+    Side,
+    SignatureTypeV2,
+    BalanceAllowanceParams,
+    AssetType,
+    PartialCreateOrderOptions,
+)
+from py_clob_client_v2.constants import POLYGON
+from py_clob_client_v2.clob_types import OrderMarketCancelParams
 
 # Web3 libraries for blockchain interaction
 from web3 import Web3
@@ -16,7 +25,7 @@ import pandas as pd                 # Data analysis
 import json                         # JSON processing
 import subprocess                   # For calling external processes
 
-from py_clob_client.clob_types import OpenOrderParams
+from py_clob_client_v2 import OpenOrderParams
 
 # Smart contract ABIs
 from poly_data.abis import NegRiskAdapterABI, ConditionalTokenABI, erc20_abi
@@ -50,27 +59,38 @@ class PolymarketClient:
         # Get credentials from environment variables
         key=os.getenv("PK")
         browser_address = os.getenv("BROWSER_ADDRESS")
+        self.dry_run = str(os.getenv("DRY_RUN", "false")).lower() in ("1", "true", "yes", "on")
 
         # Don't print sensitive wallet information
         print("Initializing Polymarket client...")
+        if self.dry_run:
+            print("[DRY_RUN] Enabled: orders/cancels/merges will be logged but NOT executed")
         chain_id=POLYGON
         self.browser_wallet=Web3.to_checksum_address(browser_address)
 
-        # Initialize the Polymarket API client
-        self.client = ClobClient(
+        # Initialize the Polymarket API client (CLOB V2 with EIP-1271 signatures)
+        # Two-step: derive API creds via L1 client, then create fully-auth client.
+        _bootstrap = ClobClient(
             host=host,
             key=key,
             chain_id=chain_id,
             funder=self.browser_wallet,
-            signature_type=2
+            signature_type=SignatureTypeV2.POLY_1271,
         )
-
-        # Set up API credentials
-        self.creds = self.client.create_or_derive_api_creds()
-        self.client.set_api_creds(creds=self.creds)
+        self.creds = _bootstrap.create_or_derive_api_key()
+        self.client = ClobClient(
+            host=host,
+            key=key,
+            chain_id=chain_id,
+            creds=self.creds,
+            funder=self.browser_wallet,
+            signature_type=SignatureTypeV2.POLY_1271,
+        )
         
         # Initialize Web3 connection to Polygon
-        web3 = Web3(Web3.HTTPProvider("https://polygon-rpc.com"))
+        # POLYGON_RPC_URL overrides the public endpoint (which has become 401/disabled)
+        rpc_url = os.getenv("POLYGON_RPC_URL", "https://polygon-bor-rpc.publicnode.com")
+        web3 = Web3(Web3.HTTPProvider(rpc_url))
         web3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
         
         # Set up USDC contract for balance checks
@@ -114,25 +134,58 @@ class PolymarketClient:
         Returns:
             dict: Response from the API containing order details, or empty dict on error
         """
-        # Create order parameters
+        # Create order parameters (V2: side must be Side enum, not raw string)
+        side_enum = Side.BUY if str(action).upper() == "BUY" else Side.SELL
         order_args = OrderArgs(
             token_id=str(marketId),
             price=price,
             size=size,
-            side=action
+            side=side_enum,
         )
 
-        signed_order = None
+        # Circuit-breaker check: refuse new BUYs once today's loss caps trip.
+        # SELLs are exempt because we ALWAYS need to be able to exit risk.
+        if side_enum == Side.BUY:
+            try:
+                import PM_circuit_breakers as _cb
+                blocked, reason = _cb.should_block_buy()
+                if blocked:
+                    print(f"[CIRCUIT] BUY blocked: {reason}")
+                    return {"circuit_blocked": True, "reason": reason,
+                            "token_id": str(marketId), "side": action,
+                            "price": price, "size": size}
+            except Exception as _cb_err:
+                print(f"[circuit] check failed (continuing): {_cb_err}")
 
-        # Handle regular vs negative risk markets differently
-        if neg_risk == False:
-            signed_order = self.client.create_order(order_args)
-        else:
-            signed_order = self.client.create_order(order_args, options=PartialCreateOrderOptions(neg_risk=True))
-            
+        if self.dry_run:
+            print(
+                f"[DRY_RUN] Would post order: token={marketId} side={action} "
+                f"price={price} size={size} neg_risk={neg_risk}"
+            )
+            # Paper-fill simulator: record the order so a later check_fills()
+            # in trading.py can mark it as filled when the real book crosses.
+            try:
+                import PM_paper_fills as _pf
+                _pf.record_post(marketId, action, price, size)
+            except Exception as _pf_err:
+                print(f"[paper] record_post failed: {_pf_err}")
+            return {
+                "dry_run": True,
+                "token_id": str(marketId),
+                "side": action,
+                "price": price,
+                "size": size,
+                "neg_risk": neg_risk,
+            }
+
+        # V2 combines create+post; SDK auto-resolves neg_risk/tick_size from token_id
         try:
-            # Submit the signed order to the API
-            resp = self.client.post_order(signed_order)
+            options = PartialCreateOrderOptions(neg_risk=True) if neg_risk else None
+            resp = self.client.create_and_post_order(
+                order_args=order_args,
+                options=options,
+                order_type=OrderType.GTC,
+            )
             return resp
         except Exception as ex:
             print(ex)
@@ -229,7 +282,7 @@ class PolymarketClient:
         Returns:
             DataFrame: All open orders with their details
         """
-        orders_df = pd.DataFrame(self.client.get_orders())
+        orders_df = pd.DataFrame(self.client.get_open_orders())
 
         # Convert numeric columns to float
         for col in ['original_size', 'size_matched', 'price']:
@@ -237,7 +290,7 @@ class PolymarketClient:
                 orders_df[col] = orders_df[col].astype(float)
 
         return orders_df
-    
+
     def get_market_orders(self, market):
         """
         Get all open orders for a specific market.
@@ -248,9 +301,9 @@ class PolymarketClient:
         Returns:
             DataFrame: Open orders for the specified market
         """
-        orders_df = pd.DataFrame(self.client.get_orders(OpenOrderParams(
-            market=market,
-        )))
+        orders_df = pd.DataFrame(self.client.get_open_orders(
+            OpenOrderParams(market=market)
+        ))
 
         # Convert numeric columns to float
         for col in ['original_size', 'size_matched', 'price']:
@@ -267,7 +320,17 @@ class PolymarketClient:
         Args:
             asset_id (str): Asset token ID
         """
-        self.client.cancel_market_orders(asset_id=str(asset_id))
+        if self.dry_run:
+            print(f"[DRY_RUN] Would cancel all orders for asset={asset_id}")
+            try:
+                import PM_paper_fills as _pf
+                _pf.record_cancel(asset_id)
+            except Exception as _pf_err:
+                print(f"[paper] record_cancel failed: {_pf_err}")
+            return
+        self.client.cancel_market_orders(
+            OrderMarketCancelParams(asset_id=str(asset_id))
+        )
 
 
     
@@ -278,7 +341,12 @@ class PolymarketClient:
         Args:
             marketId (str): Market ID
         """
-        self.client.cancel_market_orders(market=marketId)
+        if self.dry_run:
+            print(f"[DRY_RUN] Would cancel all orders for market={marketId}")
+            return
+        self.client.cancel_market_orders(
+            OrderMarketCancelParams(market=marketId)
+        )
 
     
     def merge_positions(self, amount_to_merge, condition_id, is_neg_risk_market):
@@ -301,13 +369,21 @@ class PolymarketClient:
             Exception: If the merge operation fails
         """
         amount_to_merge_str = str(amount_to_merge)
+        neg_risk_arg = "true" if is_neg_risk_market else "false"
 
-        # Prepare the command to run the JavaScript script
-        node_command = f'node poly_merger/merge.js {amount_to_merge_str} {condition_id} {"true" if is_neg_risk_market else "false"}'
-        print(node_command)
+        if self.dry_run:
+            print(
+                f"[DRY_RUN] Would merge positions: amount={amount_to_merge_str} "
+                f"condition_id={condition_id} neg_risk={neg_risk_arg}"
+            )
+            return "dry_run_merge_skipped"
+
+        # Prepare command args to avoid shell parsing issues.
+        node_command = ["node", "poly_merger/merge.js", amount_to_merge_str, str(condition_id), neg_risk_arg]
+        print("Running merge command:", " ".join(node_command))
 
         # Run the command and capture the output
-        result = subprocess.run(node_command, shell=True, capture_output=True, text=True)
+        result = subprocess.run(node_command, capture_output=True, text=True)
         
         # Check if there was an error
         if result.returncode != 0:

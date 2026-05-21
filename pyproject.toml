@@ -7,7 +7,7 @@ requires-python = ">=3.9.10"
 license = { text = "MIT" }
 
 dependencies = [
-    "py-clob-client==0.28.0",
+    "py-clob-client==0.34.6",
     "python-dotenv==1.2.1",
     "pandas==2.3.3",
     "gspread==6.2.1",
@@ -22,6 +22,10 @@ dependencies = [
     "cryptography==46.0.3",
     "google-auth==2.42.1",
     "web3==7.14.0",
+    "streamlit>=1.50.0",
+    "psutil>=7.2.2",
+    "pyyaml>=6.0.3",
+    "py-clob-client-v2==1.0.1",
 ]
 
 [project.optional-dependencies]

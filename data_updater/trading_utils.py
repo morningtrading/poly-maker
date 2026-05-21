@@ -1,7 +1,7 @@
-from py_clob_client.constants import POLYGON
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs, BalanceAllowanceParams, AssetType
-from py_clob_client.order_builder.constants import BUY
+from py_clob_client_v2.constants import POLYGON
+from py_clob_client_v2 import ClobClient
+from py_clob_client_v2 import OrderArgs, BalanceAllowanceParams, AssetType
+from py_clob_client_v2.order_builder.constants import BUY
 
 from web3 import Web3
 from web3.middleware import ExtraDataToPOAMiddleware
@@ -40,7 +40,8 @@ def get_clob_client():
 
 
 def approveContracts():
-    web3 = Web3(Web3.HTTPProvider("https://polygon-rpc.com"))
+    rpc_url = os.getenv("POLYGON_RPC_URL", "https://polygon-bor-rpc.publicnode.com")
+    web3 = Web3(Web3.HTTPProvider(rpc_url))
     web3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
     wallet = web3.eth.account.from_key(os.getenv("PK"))
     

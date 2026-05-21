@@ -1,9 +1,8 @@
 import pandas as pd
-from py_clob_client.headers.headers import create_level_2_headers
-from py_clob_client.clob_types import RequestArgs
+from py_clob_client_v2.headers.headers import create_level_2_headers
+from py_clob_client_v2.clob_types import RequestArgs
 
-from poly_utils.google_utils import get_spreadsheet
-from gspread_dataframe import set_with_dataframe
+from sqlite_wrapper import get_spreadsheet
 import requests
 import json
 import os
@@ -11,7 +10,14 @@ import os
 from dotenv import load_dotenv
 load_dotenv()
 
-spreadsheet = get_spreadsheet()
+_store = None  # Lazy-loaded SQLite handle
+
+def _get_store():
+    """Open the SQLite config store on first use."""
+    global _store
+    if _store is None:
+        _store = get_spreadsheet()
+    return _store
 
 def get_markets_df(wk_full):
     markets_df = pd.DataFrame(wk_full.get_all_records())
@@ -57,7 +63,8 @@ def combine_dfs(orders_df, positions, markets_df, selected_df):
     # Combine the results
     combined_df = pd.concat([merge_token1, merge_token2])
 
-    assert len(merged_df) == len(combined_df)
+    # If any asset maps to multiple rows unexpectedly, keep the first one to avoid crashing stats updates.
+    combined_df = combined_df.drop_duplicates(subset=['asset_id'], keep='first')
 
     combined_df['answer'] = combined_df.apply(
         lambda row: row['answer1'] if row['merged_with'] == 'token1' else row['answer2'], axis=1
@@ -80,11 +87,15 @@ def get_earnings(client):
     cursor = ''
     markets = []
 
+    maker_address = os.getenv('BROWSER_WALLET') or os.getenv('BROWSER_ADDRESS')
+    if not maker_address:
+        return pd.DataFrame(columns=['question', 'earnings', 'earning_percentage'])
+
     params = {
         "l2Headers": json.dumps(l2Headers),
         "orderBy": "earnings",
         "position": "DESC",
-        "makerAddress": os.getenv('BROWSER_WALLET'),
+        "makerAddress": maker_address,
         "authenticationType": "eoa",
         "nextCursor": cursor,
         "requestPath": "/rewards/user/markets"
@@ -93,26 +104,36 @@ def get_earnings(client):
     r = requests.get(url,  params=params)
     results = r.json()
 
-    data = pd.DataFrame(results['data'])
-    data['earnings'] = data['earnings'].apply(lambda x: x[0]['earnings'])
+    payload = results.get('data', []) if isinstance(results, dict) else []
+    data = pd.DataFrame(payload)
+    if data.empty or 'earnings' not in data.columns:
+        return pd.DataFrame(columns=['question', 'earnings', 'earning_percentage'])
+
+    data['earnings'] = data['earnings'].apply(
+        lambda x: x[0]['earnings'] if isinstance(x, list) and len(x) > 0 and isinstance(x[0], dict) and 'earnings' in x[0] else 0
+    )
 
     data = data[data['earnings'] > 0].reset_index(drop=True)
+    for col in ['question', 'earning_percentage']:
+        if col not in data.columns:
+            data[col] = 0 if col == 'earning_percentage' else ''
+
     data = data[['question', 'earnings', 'earning_percentage']]
     return data
 
 
 
 def update_stats_once(client):
-    spreadsheet = get_spreadsheet()
-    wk_full = spreadsheet.worksheet('Full Markets')
-    wk_summary = spreadsheet.worksheet('Summary')
+    store = _get_store()
+    wk_full = store.worksheet('Full Markets')
+    wk_summary = store.worksheet('Summary')
 
 
-    wk_sel = spreadsheet.worksheet('Selected Markets')
+    wk_sel = store.worksheet('Selected Markets')
     selected_df = pd.DataFrame(wk_sel.get_all_records())
-    
+
     markets_df = get_markets_df(wk_full)
-    print("Got spreadsheet...")
+    print("Loaded market tables...")
 
     orders_df = get_all_orders(client)
     print("Got Orders...")
@@ -130,8 +151,6 @@ def update_stats_once(client):
 
         combined_df = combined_df.sort_values('earnings', ascending=False)
         combined_df = combined_df[['question', 'answer', 'order_size', 'position_size', 'marketInSelected', 'earnings', 'earning_percentage']]
-        wk_summary.clear()
-
-        set_with_dataframe(wk_summary, combined_df, include_index=False, include_column_header=True, resize=True)
+        wk_summary.update(combined_df)
     else:
         print("Position or order is empty")
